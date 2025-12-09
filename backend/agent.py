@@ -12,6 +12,7 @@ load_dotenv()
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 from tools import execute_tool
+from database import format_context_for_prompt, save_message
 
 # ============================================================================
 # 1. DEFINE AGENT STATE
@@ -29,7 +30,9 @@ class AgentState(TypedDict):
     tools_used: List[str]                 # Track tools/nodes executed
     tool_calls: List[str]                 # Track tool execution
     tool_results: Dict[str, Any]          # Results from tools
-    conversation_context: Dict[str, Any]  # Arbitrary context data
+    conversation_context: Dict[str, Any]  # Previous context (NEW)
+    conversation_id: str                  # Which conversation (NEW)
+    conversation_turn: int                # Which turn (NEW)
     request_id: str                       # Unique ID for tracing
     final_response: str                   # The generated response to return
 
@@ -41,8 +44,9 @@ class AgentState(TypedDict):
 async def query_analyzer_node(state: AgentState) -> Dict[str, Any]:
     """
     Node A: Query Analyzer
-    Analyzes the latest user message to determine intent (Code vs General).
+    Analyzes the latest user message, considering conversation history
     """
+    
     print("--- 🔍 Analyzing Query ---")
     
     messages = state.get("messages", [])
@@ -51,14 +55,35 @@ async def query_analyzer_node(state: AgentState) -> Dict[str, Any]:
     
     last_message = messages[-1]["content"].lower()
     
-    # Simple keyword-based intent detection
-    # In a real app, you might use a lightweight LLM or classifier here
-    code_keywords = ["code", "python", "function", "bug", "error", "api", "json", "debug"]
+    # Check for context-dependent intents
+    conversation_context = state.get("conversation_context", {})
+    previous_intent = None
+    
+    if conversation_context and "messages" in conversation_context:
+        # Look at previous intents from last 3 messages
+        # Note: 'messages' in context are chronological, so we look at the end
+        recent_msgs = conversation_context["messages"]
+        for msg in recent_msgs[-3:]: 
+            if msg.get("intent"):
+                previous_intent = msg["intent"]
+        print(f"  → Context: Previous intent was '{previous_intent}'")
+    else:
+        print("  → Context: No previous context found")
+    
+    # Keyword-based detection (with context consideration)
+    code_keywords = ["code", "python", "function", "bug", "error", "api", "json", "debug",
+                     "write", "implement", "fix", "script", "execute", "run"]
     
     if any(keyword in last_message for keyword in code_keywords):
         intent = "code"
+        print("  → Decision: Keywords detected")
+    elif previous_intent == "code" and any(word in last_message for word in ["explain", "how", "why", "more", "detail"]):
+        # Follow-up to code context
+        intent = "code"
+        print("  → Decision: Follow-up to previous code context")
     else:
         intent = "general"
+        print("  → Decision: General intent")
         
     print(f"Detected Intent: {intent}")
     
@@ -104,6 +129,12 @@ async def model_executor_node(state: AgentState) -> Dict[str, Any]:
     
     # Build prompt with tool results
     prompt = ""
+    
+    # ENHANCED: Add conversation context
+    conversation_context = state.get("conversation_context", {})
+    if conversation_context and conversation_context.get("recent_turns", 0) > 0:
+        context_str = await format_context_for_prompt(conversation_context)
+        prompt = context_str + "\n\nNow, respond to the user:\n"
     
     # Add System Prompt based on intent to improve generation quality
     intent = state.get("intent", "general")
@@ -178,6 +209,46 @@ async def response_formatter_node(state: AgentState) -> Dict[str, Any]:
     return {
         "conversation_context": metadata,
         "tools_used": current_tools + ["response_formatter"]
+    }
+
+async def memory_update_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Node H: Memory Update
+    Saves the current turn to database for persistence
+    """
+    
+    print("--- 💾 Saving to Memory ---")
+    
+    conversation_id = state.get("conversation_id")
+    if not conversation_id:
+        print("  ℹ️ No conversation ID, skipping memory save")
+        return {}
+    
+    # Save user message (if not already saved)
+    messages = state.get("messages", [])
+    if messages and messages[-1]["role"] == "user":
+        user_content = messages[-1]["content"]
+        await save_message(
+            conversation_id,
+            role="user",
+            content=user_content,
+            intent=state.get("intent")
+        )
+    
+    # Save assistant response
+    response = state.get("final_response", "")
+    await save_message(
+        conversation_id,
+        role="assistant",
+        content=response,
+        model_used=state.get("model"),
+        tokens_used=len(response.split())  # Approximate token count
+    )
+    
+    current_tools = state.get("tools_used", [])
+    
+    return {
+        "tools_used": current_tools + ["memory_update"]
     }
 
 async def tool_router_node(state: AgentState) -> Dict[str, Any]:
@@ -322,6 +393,7 @@ workflow.add_node("tool_executor", tool_executor_node)
 workflow.add_node("model_executor", model_executor_node)
 workflow.add_node("code_runner", code_runner_node)
 workflow.add_node("response_formatter", response_formatter_node)
+workflow.add_node("memory_update", memory_update_node)
 
 # Add edges to define the flow
 # Entry Point -> Analyzer
@@ -345,8 +417,11 @@ workflow.add_edge("model_executor", "code_runner")
 # Code Runner -> Formatter
 workflow.add_edge("code_runner", "response_formatter")
 
-# Formatter -> End
-workflow.add_edge("response_formatter", END)
+# Formatter -> Memory Update
+workflow.add_edge("response_formatter", "memory_update")
+
+# Memory Update -> End
+workflow.add_edge("memory_update", END)
 
 # Compile the graph
 agent_app = workflow.compile()

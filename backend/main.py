@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 import uuid
+from database import create_conversation, get_recent_context, init_database
 from agent import agent_app, AgentState
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +22,10 @@ async def lifespan(app: FastAPI):
     print("=" * 60)
     print("🚀 AI Agent Backend Starting...")
     print("=" * 60)
+    
+    # Initialize Database
+    await init_database()
+    
     health = await check_ollama_health()
     if health:
         print("✅ Ollama connected")
@@ -60,9 +65,11 @@ class ChatMessage(BaseModel):
     role: str  # "user" or "assistant"
     content: str
 
+
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
     model: Optional[str] = DEFAULT_MODEL
+    conversation_id: Optional[str] = None
     temperature: float = 0.7
     max_tokens: int = 2048
     stream: bool = True
@@ -181,26 +188,47 @@ async def chat_endpoint(request: ChatRequest):
     # Generate unique request ID
     request_id = str(uuid.uuid4())
     
-    # 1. Prepare Agent State
+    # 1. Handle Conversation ID & Memory
+    conversation_id = request.conversation_id
+    
+    # Check for "string" placeholder (Swagger default) or empty
+    if conversation_id and conversation_id.strip() == "string":
+        conversation_id = None
+        
+    conversation_context = {}
+    
+    if not conversation_id:
+        # Create new conversation if none provided
+        conversation_id = await create_conversation(model_preference=request.model or "auto")
+        print(f"🆕 Created new conversation: {conversation_id}")
+    
+    # Load persistence context
+    conversation_context = await get_recent_context(conversation_id, num_turns=4) or {}
+    
+    # Calculate turn number
+    current_turn = (conversation_context.get("turn_count", 0)) + 1
+    
+    print(f"🔄 invoking agent for request {request_id} (Conv: {conversation_id}, Turn: {current_turn})")
+    
+    # 2. Prepare Agent State
     # We initialize the state with the user's input and context
     initial_state: AgentState = {
         "messages": [m.dict() for m in request.messages],
         "model": request.model,  # Optional: User can suggest, but agent might override in 'model_selector'
         "intent": "general",     # Default
         "tools_used": [],
-        "conversation_context": {},
+        "conversation_context": conversation_context,  # NEW
+        "conversation_id": conversation_id,            # NEW
+        "conversation_turn": current_turn,             # NEW
         "request_id": request_id,
-        "final_response": ""
+        "final_response": "",
+        "tool_calls": [],
+        "tool_results": {}
     }
     
-    print(f"🔄 invoking agent for request {request_id}")
-    
-    # 2. Invoke Agent
+    # 3. Invoke Agent
     # We use ainvoke to run the graph asynchronously.
     try:
-        # Note: ainvoke waits for the entire graph to finish.
-        # For true streaming of tokens from the LLM, we'd need to stream events from the graph.
-        # For now, we simulate streaming the final result to keep frontend compatibility.
         final_state = await agent_app.ainvoke(initial_state)
         
         response_text = final_state.get("final_response", "")
@@ -211,17 +239,9 @@ async def chat_endpoint(request: ChatRequest):
         print(f"❌ Agent invocation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    # 3. Stream Response
+    # 4. Stream Response
     # We yield the payload in SSE format as expected by the frontend/client
     async def generate():
-        # Yield metadata first (optional, or just log it)
-        # yield f"data: {json.dumps({'type': 'metadata', 'tools': tools_used})}\n\n"
-        
-        # Yield the response content
-        # Splitting by words to simulate streaming if it's a bulk response
-        # or just yielding the whole thing if okay. 
-        # Let's yield it in chunks to mimic the "token" structure the client expects.
-        
         chunk_size = 10
         for i in range(0, len(response_text), chunk_size):
             chunk = response_text[i:i+chunk_size]
@@ -233,9 +253,58 @@ async def chat_endpoint(request: ChatRequest):
         media_type="text/event-stream",
         headers={
             "X-Model-Used": model_used,
-            "X-Tools-Used": ",".join(tools_used)
+            "X-Tools-Used": ",".join(tools_used),
+            "X-Conversation-ID": conversation_id,
+            "X-Turn-Number": str(current_turn)
         }
     )
+
+        
+
+@app.get("/api/conversations")
+async def get_conversations(limit: int = 20):
+    """List recent conversations for sidebar"""
+    # Dynamic import to avoid circular dependency if needed, 
+    # but top-level import is fine if database.py doesn't import main
+    from database import list_conversations
+    conversations = await list_conversations(limit)
+    return {
+        "conversations": conversations,
+        "count": len(conversations),
+        "limit": limit
+    }
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation_details(conversation_id: str):
+    """Get conversation stats and details"""
+    from database import get_conversation_stats, load_conversation
+    
+    stats = await get_conversation_stats(conversation_id)
+    if not stats:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+        
+    messages = await load_conversation(conversation_id, limit=50)
+    
+    return {
+        "conversation_id": conversation_id,
+        "messages": messages,
+        "stats": stats,
+        "message_count": len(messages)
+    }
+    
+@app.post("/api/conversations/{conversation_id}/archive")
+async def archive_conversation_endpoint(conversation_id: str):
+    """Archive a conversation (soft delete)"""
+    from database import archive_conversation
+    success = await archive_conversation(conversation_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+        
+    return {
+        "success": success,
+        "conversation_id": conversation_id,
+        "message": "Conversation archived successfully"
+    }
 
 class QueryRequest(BaseModel):
     query: str
