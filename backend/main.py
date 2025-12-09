@@ -269,7 +269,8 @@ async def route_query(request: QueryRequest):
             "recommended_model": final_state.get("model"),
             "reason": f"Detected intent: {final_state.get('intent')}",
             "available_models": list(AVAILABLE_MODELS.keys()),
-            "agent_trace": final_state.get("tools_used")
+            "agent_trace": final_state.get("tools_used"),
+            "response": final_state.get("final_response")
         }
         
     except Exception as e:

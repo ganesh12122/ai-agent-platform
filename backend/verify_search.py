@@ -8,15 +8,26 @@ sys.path.append(os.getcwd())
 from tools import execute_tool
 
 async def test():
-    print("Testing Web Search Tool...")
-    try:
-        result = await execute_tool('web_search', query='latest AI news')
-        print(f"Result Type: {type(result)}")
-        print(f"Result Keys: {result.keys()}")
-        print(f"Content Length: {len(str(result.get('result', '')))}")
-        print("Success ✅")
-    except Exception as e:
-        print(f"Error ❌: {e}")
+    print("Testing Web Search Tool for Date...")
+    queries = [
+        "current date today india",
+        "what is the date today",
+        "today date"
+    ]
+    
+    for q in queries:
+        print(f"\nQuerying: '{q}'")
+        try:
+            result = await execute_tool('web_search', query=q)
+            res_str = str(result.get('result', ''))
+            print(f"Result Length: {len(res_str)}")
+            print(f"Preview: {res_str[:200]}...")
+            if "No results found" in res_str:
+                print("❌ No results")
+            else:
+                print("✅ Results found")
+        except Exception as e:
+            print(f"Error ❌: {e}")
 
 if __name__ == "__main__":
     asyncio.run(test())

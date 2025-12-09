@@ -3,95 +3,58 @@ Web Search Tool - Uses DuckDuckGo API
 Safe, free, no API key required
 """
 
-import httpx
-import json
-from typing import List, Dict, Any
+import asyncio
+from duckduckgo_search import DDGS
 from datetime import datetime
-
-# DuckDuckGo Instant API (Free, no auth needed)
-DDGO_API_URL = "https://api.duckduckgo.com"
 
 async def web_search_tool(query: str, num_results: int = 5) -> str:
     """
-    Search the web using DuckDuckGo API
-    
-    Args:
-        query: Search query string
-        num_results: Number of results to return (max 10)
-    
-    Returns:
-        Formatted search results as string
-    
-    Example:
-        >>> result = await web_search_tool("latest AI news")
-        >>> print(result)
-        "1. Title - snippet - url"
+    Search the web using the robust duckduckgo-search package.
     """
-    
     if not query or len(query.strip()) < 3:
         return "❌ Search query too short (min 3 characters)"
     
     try:
-        # Call DuckDuckGo API
-        params = {
-            "q": query,
-            "format": "json",
-            "no_html": 1,
-            "skip_disambig": 1
-        }
+        # Use DDGS for search
+        # Run in executor to avoid blocking async loop since DDGS is sync/blocking by default in older versions
+        # or use the async context manager if available (latest version supports async)
         
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(DDGO_API_URL, params=params)
-            response.raise_for_status()
-            data = response.json()
+        # Checking latest docs: DDGS().text() is synchronous. We should run it in a thread.
+        # However, for simplicity let's try direct call first, or better wrap in to_thread.
         
-        # Extract results
         results = []
         
-        # Get instant answer if available
-        if data.get("AbstractText"):
-            results.append({
-                "title": "Abstract",
-                "snippet": data.get("AbstractText", ""),
-                "url": data.get("AbstractURL", "")
-            })
+        # Synchronous call wrapping
+        def run_search():
+            with DDGS() as ddgs:
+                return list(ddgs.text(query, max_results=num_results))
+                
+        # Run in thread pool
+        raw_results = await asyncio.to_thread(run_search)
         
-        # Get related topics/results
-        related_topics = data.get("RelatedTopics", [])
-        for topic in related_topics[:num_results]:
-            if isinstance(topic, dict):
-                results.append({
-                    "title": topic.get("FirstURL", "").split("/")[-1] or "Result",
-                    "snippet": topic.get("Text", ""),
-                    "url": topic.get("FirstURL", "")
-                })
-        
-        # Format results
-        if not results:
+        if not raw_results:
             return f"No results found for: {query}"
-        
+            
         formatted = f"🔍 Search Results for '{query}'\\n\\n"
-        for i, result in enumerate(results[:num_results], 1):
-            formatted += f"{i}. **{result['title']}**\\n"
-            formatted += f"   {result['snippet'][:200]}...\\n"
-            formatted += f"   🔗 {result['url']}\\n\\n"
-        
+        for i, res in enumerate(raw_results, 1):
+            title = res.get('title', 'No Title')
+            snippet = res.get('body', '') or res.get('snippet', '')
+            url = res.get('href', '') or res.get('link', '')
+            
+            formatted += f"{i}. **{title}**\\n"
+            formatted += f"   {snippet[:200]}...\\n"
+            formatted += f"   🔗 {url}\\n\\n"
+            
         formatted += f"\\n⏰ Searched at: {datetime.now().isoformat()}"
         return formatted
-    
-    except httpx.TimeoutException:
-        return "❌ Search timeout - DuckDuckGo took too long"
+        
     except Exception as e:
         return f"❌ Search error: {str(e)}"
 
-
-# Test function (run: python -m tools.web_search)
 if __name__ == "__main__":
-    import asyncio
-    
     async def test():
         print("Testing web search...")
-        result = await web_search_tool("Python 3.12 release date")
-        print(result)
-    
-    asyncio.run(test())
+        # result = await web_search_tool("Python 3.12 release date") # Commented out to avoid auto-run
+        # print(result)
+        pass
+    # asyncio.run(test())
