@@ -103,7 +103,20 @@ async def model_executor_node(state: AgentState) -> Dict[str, Any]:
     tool_results = state.get("tool_results", {})
     
     # Build prompt with tool results
-    prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+    prompt = ""
+    
+    # Add System Prompt based on intent to improve generation quality
+    intent = state.get("intent", "general")
+    if intent == "code":
+        prompt += (
+            "SYSTEM: You are an expert Python coder. "
+            "Write a SINGLE, COMPLETE, and RUNNABLE Python script to solve the user's problem. "
+            "The script MUST print the final result to stdout. "
+            "Do not use input(). Do not use placeholders. "
+            "Ensure all code is inside a single ```python block.\n\n"
+        )
+    
+    prompt += "\n".join([f"{m['role']}: {m['content']}" for m in messages])
     
     # Add tool results as context
     if tool_results:
@@ -246,6 +259,54 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
         "tools_used": current_tools + ["tool_executor"]
     }
 
+import re
+
+async def code_runner_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Node G: Code Runner
+    
+    Parses the LLM response for Python code blocks and executes them.
+    Appends the output to the final response.
+    """
+    print("--- 🏃 Running Generated Code ---")
+    
+    intent = state.get("intent", "general")
+    tool_calls = state.get("tool_calls", [])
+    response_text = state.get("final_response", "")
+    
+    # Only run if code intent or explicitly requested
+    if intent != "code" and "code_executor" not in tool_calls:
+        return {"tools_used": state.get("tools_used", []) + ["code_runner"]}
+        
+    # Extract code blocks
+    code_blocks = re.findall(r"```python(.*?)```", response_text, re.DOTALL)
+    
+    if not code_blocks:
+        print("  → No code blocks found to execute")
+        return {"tools_used": state.get("tools_used", []) + ["code_runner"]}
+        
+    print(f"  → Found {len(code_blocks)} code blocks")
+    execution_output = ""
+    
+    for i, code in enumerate(code_blocks):
+        print(f"  → Executing block {i+1}...")
+        try:
+            # Use the existing execute_tool function
+            result = await execute_tool("code_executor", code=code.strip())
+            output = result.get("result", "")
+            execution_output += f"\n\n[Block {i+1} Execution Result]:\n{output}"
+        except Exception as e:
+            execution_output += f"\n\n[Block {i+1} Error]:\n{str(e)}"
+            
+    # Append execution results to the final response
+    updated_response = response_text + "\n" + execution_output
+    
+    current_tools = state.get("tools_used", [])
+    return {
+        "final_response": updated_response,
+        "tools_used": current_tools + ["code_runner"]
+    }
+
 # ============================================================================
 # 3. BUILD THE GRAPH
 # ============================================================================
@@ -259,6 +320,7 @@ workflow.add_node("model_selector", model_selector_node)
 workflow.add_node("tool_router", tool_router_node)
 workflow.add_node("tool_executor", tool_executor_node)
 workflow.add_node("model_executor", model_executor_node)
+workflow.add_node("code_runner", code_runner_node)
 workflow.add_node("response_formatter", response_formatter_node)
 
 # Add edges to define the flow
@@ -277,8 +339,11 @@ workflow.add_edge("tool_router", "tool_executor")
 # Tool Executor -> Model Executor (LLM)
 workflow.add_edge("tool_executor", "model_executor")
 
-# Model Executor -> Formatter
-workflow.add_edge("model_executor", "response_formatter")
+# Model Executor -> Code Runner (NEW)
+workflow.add_edge("model_executor", "code_runner")
+
+# Code Runner -> Formatter
+workflow.add_edge("code_runner", "response_formatter")
 
 # Formatter -> End
 workflow.add_edge("response_formatter", END)
